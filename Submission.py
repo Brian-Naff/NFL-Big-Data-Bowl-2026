@@ -1,4 +1,7 @@
+"""
+NFL Big Data Bowl 2026 — Player Movement Prediction Inference Pipeline
 
+"""
 
 import torch
 import torch.nn as nn
@@ -9,12 +12,13 @@ from pathlib import Path
 import pickle
 
 class Config:
+ 
     MODEL_DIR = Path("/kaggle/input/nfl-exact-058-models/outputs")
-    WINDOW_SIZE = 10  # EXACT 0.58
+    WINDOW_SIZE = 10  # number of observed frames passed to the sequence model
     MAX_FUTURE_HORIZON = 94
-    K_NEIGH = 6
-    RADIUS = 30.0
-    TAU = 8.0
+    K_NEIGH = 6       # maximum number of nearby players used in neighbor features
+    RADIUS = 30.0     # yards; ignore neighbors farther away than this radius
+    TAU = 8.0         # distance-decay scale for neighbor weighting
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 _models = None
@@ -23,6 +27,11 @@ _route_kmeans = None
 _route_scaler = None
 
 def load_models_once():
+    """Load saved model folds and preprocessing artifacts once per session.
+
+    Kaggle calls "predict" repeatedly through the inference server, so caching
+    these artifacts avoids reloading model weights and scalers on every batch.
+    """
     global _models, _scalers, _route_kmeans, _route_scaler
     if _models is not None:
         return
@@ -45,7 +54,10 @@ def load_models_once():
             _scalers.append(pickle.load(f))
 
 class SeqModel(nn.Module):
-    """EXACT 0.58 architecture"""
+    """GRU-attention trajectory model.
+
+        Predicts futre displacements
+    """
     def __init__(self, input_dim, horizon):
         super().__init__()
         self.gru = nn.GRU(input_dim, 128, num_layers=2, batch_first=True, dropout=0.1, bidirectional=False)
@@ -66,10 +78,12 @@ class SeqModel(nn.Module):
         return torch.cumsum(out.view(B, -1, 2), dim=1)
 
 def get_velocity(speed, direction_deg):
+    """Convert speed and direction angle into x/y velocity components."""
     theta = np.deg2rad(direction_deg)
     return speed * np.sin(theta), speed * np.cos(theta)
 
 def height_to_feet(height_str):
+    """Convert NFL height strings such as '6-2' into decimal feet."""
     try:
         ft, inches = map(int, str(height_str).split('-'))
         return ft + inches/12
@@ -77,6 +91,15 @@ def height_to_feet(height_str):
         return 6.0
 
 def compute_geometric_endpoint(df):
+    """Create a role-aware geometric endpoint estimate for each player.
+
+    Features:
+    - targeted receivers are pulled toward the ball landing point,
+    - coverage defenders are pulled toward a mirrored receiver endpoint when a
+      plausible receiver match exists,
+    - other players default to a short constant-velocity projection.
+
+    """
     df = df.copy()
     t_total = df.get('num_frames_output', 30) / 10.0
     df['time_to_endpoint'] = t_total
@@ -105,6 +128,11 @@ def compute_geometric_endpoint(df):
     return df
 
 def add_geometric_features(df):
+    """Add features describing how hard it is to reach the geometric endpoint.
+
+    These features summarize distance, required velocity/acceleration, alignment
+    with current motion, sideline constraints, turning angle.
+    """
     df = compute_geometric_endpoint(df)
     df['geo_vector_x'] = df['geo_endpoint_x'] - df['x']
     df['geo_vector_y'] = df['geo_endpoint_y'] - df['y']
@@ -146,8 +174,13 @@ def add_geometric_features(df):
     
     return df
 
-# COMPACT feature engineering for inference speed
 def get_opponent_features(input_df):
+    """Summarize immediate opponent pressure at the last observed frame.
+
+    For each player, this computes nearest-opponent distance, nearby opponent
+    counts, closing speed, and coverage-defender mirroring features. These are
+    intended to give the model local defensive context.
+    """
     features = []
     for (gid, pid), group in input_df.groupby(['game_id', 'play_id']):
         last = group.sort_values('frame_id').groupby('nfl_id').last()
@@ -207,6 +240,8 @@ def get_opponent_features(input_df):
     return pd.DataFrame(features)
 
 def extract_route_patterns(input_df):
+    """Extract simple recent-trajectory shape features.
+    """
     route_features = []
     for (gid, pid, nid), group in input_df.groupby(['game_id', 'play_id', 'nfl_id']):
         traj = group.sort_values('frame_id').tail(5)
@@ -245,6 +280,11 @@ def extract_route_patterns(input_df):
     return route_df
 
 def compute_neighbor_embeddings(input_df):
+    """Build graph-style local context features from nearby players.
+
+    For each player, nearby teammates and opponents are summarized with
+    distance-weighted relative position and velocity. 
+    """
     cols_needed = ["game_id", "play_id", "nfl_id", "frame_id", "x", "y", "velocity_x", "velocity_y", "player_side"]
     src = input_df[cols_needed].copy()
     
@@ -313,18 +353,30 @@ def compute_neighbor_embeddings(input_df):
     return ag
 
 def predict(test: pl.DataFrame, test_input: pl.DataFrame) -> pd.DataFrame:
+    
     load_models_once()
     
     test_df = test.to_pandas()
     input_df = test_input.to_pandas()
     input_df = input_df.sort_values(['game_id', 'play_id', 'nfl_id', 'frame_id'])
     
-    # Build all 174 features (same as training)
+    # ------------------------------------------------------------------
+    # Player body-size features
+    # ------------------------------------------------------------------
+    # These features are simple proxies for player physical profile. They are
+    # kept in inference because the saved scalers and model were trained with
+    # the same feature set.
     input_df['player_height_feet'] = input_df['player_height'].apply(height_to_feet)
     height_parts = input_df['player_height'].str.split('-', expand=True)
     input_df['height_inches'] = height_parts[0].astype(float) * 12 + height_parts[1].astype(float)
     input_df['bmi'] = (input_df['player_weight'] / (input_df['height_inches']**2)) * 703
     
+    # ------------------------------------------------------------------
+    # Kinematic features
+    # ------------------------------------------------------------------
+    # Convert tracking speed/direction into velocity, acceleration, momentum,
+    # and orientation features. The exact formulas must match training-time
+    # preprocessing so the saved scalers and model weights remain valid.
     dir_rad = np.deg2rad(input_df['dir'].fillna(0))
     input_df['velocity_x'] = input_df['s'] * np.sin(dir_rad)
     input_df['velocity_y'] = input_df['s'] * np.cos(dir_rad)
@@ -336,6 +388,11 @@ def predict(test: pl.DataFrame, test_input: pl.DataFrame) -> pd.DataFrame:
     input_df['kinetic_energy'] = 0.5 * input_df['player_weight'] * input_df['speed_squared']
     input_df['orientation_diff'] = np.minimum(np.abs(input_df['o'] - input_df['dir']), 360 - np.abs(input_df['o'] - input_df['dir']))
     
+    # ------------------------------------------------------------------
+    # Role and side indicators
+    # ------------------------------------------------------------------
+    # Player role is highly predictive in this task: a targeted receiver,
+    # coverage defender, and passer have very different movement objectives.
     input_df['is_offense'] = (input_df['player_side'] == 'Offense').astype(int)
     input_df['is_defense'] = (input_df['player_side'] == 'Defense').astype(int)
     input_df['is_receiver'] = (input_df['player_role'] == 'Targeted Receiver').astype(int)
@@ -344,6 +401,12 @@ def predict(test: pl.DataFrame, test_input: pl.DataFrame) -> pd.DataFrame:
     input_df['role_targeted_receiver'], input_df['role_defensive_coverage'], input_df['role_passer'] = input_df['is_receiver'], input_df['is_coverage'], input_df['is_passer']
     input_df['side_offense'] = input_df['is_offense']
     
+    # ------------------------------------------------------------------
+    # Ball landing context
+    # ------------------------------------------------------------------
+    # The Big Data Bowl task provides ball landing location at inference time.
+    # These features describe each player's distance, direction, and velocity
+    # alignment relative to that landing point.
     if 'ball_land_x' in input_df.columns:
         ball_dx, ball_dy = input_df['ball_land_x'] - input_df['x'], input_df['ball_land_y'] - input_df['y']
         input_df['distance_to_ball'] = np.sqrt(ball_dx**2 + ball_dy**2)
@@ -355,6 +418,11 @@ def predict(test: pl.DataFrame, test_input: pl.DataFrame) -> pd.DataFrame:
         input_df['velocity_alignment'] = np.cos(input_df['angle_to_ball'] - dir_rad)
         input_df['angle_diff'] = np.minimum(np.abs(input_df['o'] - np.degrees(input_df['angle_to_ball'])), 360 - np.abs(input_df['o'] - np.degrees(input_df['angle_to_ball'])))
     
+    # ------------------------------------------------------------------
+    # Local spatial context features
+    # ------------------------------------------------------------------
+    # These three feature groups summarize opponent pressure, route shape, and
+    # nearby-player context before the temporal sequence is passed to the model.
     opp_features = get_opponent_features(input_df)
     input_df = input_df.merge(opp_features, on=['game_id', 'play_id', 'nfl_id'], how='left')
     
@@ -364,17 +432,27 @@ def predict(test: pl.DataFrame, test_input: pl.DataFrame) -> pd.DataFrame:
     gnn_features = compute_neighbor_embeddings(input_df)
     input_df = input_df.merge(gnn_features, on=['game_id', 'play_id', 'nfl_id'], how='left')
     
+    # Convert nearest-opponent distance into simple pressure indicators.
+    # Higher pressure means less local space and usually stronger path
+    # constraints on the player's future movement.
     if 'nearest_opp_dist' in input_df.columns:
         input_df['pressure'] = 1 / np.maximum(input_df['nearest_opp_dist'], 0.5)
         input_df['under_pressure'] = (input_df['nearest_opp_dist'] < 3).astype(int)
         input_df['pressure_x_speed'] = input_df['pressure'] * input_df['s']
     
+    # For coverage defenders, compare their movement to the nearest receiver.
+    # This approximates man-coverage mirroring and separation behavior.
     if 'mirror_wr_vx' in input_df.columns:
         s_safe = np.maximum(input_df['s'], 0.1)
         input_df['mirror_similarity'] = (input_df['velocity_x'] * input_df['mirror_wr_vx'] + input_df['velocity_y'] * input_df['mirror_wr_vy']) / s_safe
         input_df['mirror_offset_dist'] = np.sqrt(input_df['mirror_offset_x']**2 + input_df['mirror_offset_y']**2)
         input_df['mirror_alignment'] = input_df['mirror_similarity'] * input_df['role_defensive_coverage']
     
+    # ------------------------------------------------------------------
+    # Temporal history features
+    # ------------------------------------------------------------------
+    # Lags, rolling statistics, deltas, and EMAs give the model recent motion
+    # history beyond the raw sequence window.
     gcols = ['game_id', 'play_id', 'nfl_id']
     for lag in [1, 2, 3, 4, 5]:
         for col in ['x', 'y', 'velocity_x', 'velocity_y', 's', 'a']:
@@ -395,6 +473,11 @@ def predict(test: pl.DataFrame, test_input: pl.DataFrame) -> pd.DataFrame:
     input_df['velocity_y_ema'] = input_df.groupby(gcols)['velocity_y'].transform(lambda x: x.ewm(alpha=0.3, adjust=False).mean())
     input_df['speed_ema'] = input_df.groupby(gcols)['s'].transform(lambda x: x.ewm(alpha=0.3, adjust=False).mean())
     
+    # ------------------------------------------------------------------
+    # Time-to-horizon features
+    # ------------------------------------------------------------------
+    # These features describe how much prediction horizon remains and how far a
+    # simple constant-velocity projection would be from the ball landing point.
     if 'num_frames_output' in input_df.columns:
         max_frames = input_df['num_frames_output']
         input_df['max_play_duration'], input_df['frame_time'] = max_frames / 10.0, input_df['frame_id'] / 10.0
@@ -411,8 +494,15 @@ def predict(test: pl.DataFrame, test_input: pl.DataFrame) -> pd.DataFrame:
         input_df['velocity_x_progress'], input_df['velocity_y_progress'] = input_df['velocity_x'] * input_df['progress_ratio'], input_df['velocity_y'] * input_df['progress_ratio']
         input_df['speed_scaled_by_time_left'], input_df['actual_play_length'], input_df['length_ratio'] = input_df['s'] * input_df['time_remaining'], max_frames, max_frames / 30.0
     
+    # Role-aware geometric endpoint features are added last because they use
+    # several of the previously computed kinematic and mirroring features.
     input_df = add_geometric_features(input_df)
-    
+
+    # ------------------------------------------------------------------
+    # Feature list used by the trained model
+    # ------------------------------------------------------------------
+    # The final set is filtered to columns present in the inference batch, but
+    # the ordering must remain consistent with training and saved scalers.
     feature_cols = ['x', 'y', 's', 'a', 'o', 'dir', 'frame_id', 'ball_land_x', 'ball_land_y', 'player_height_feet', 'player_weight', 'height_inches', 'bmi',
                     'velocity_x', 'velocity_y', 'acceleration_x', 'acceleration_y', 'momentum_x', 'momentum_y', 'kinetic_energy', 'speed_squared', 'accel_magnitude', 'orientation_diff',
                     'is_offense', 'is_defense', 'is_receiver', 'is_coverage', 'is_passer', 'role_targeted_receiver', 'role_defensive_coverage', 'role_passer', 'side_offense',
@@ -439,6 +529,12 @@ def predict(test: pl.DataFrame, test_input: pl.DataFrame) -> pd.DataFrame:
     
     feature_cols = [c for c in feature_cols if c in input_df.columns]
     
+    # ------------------------------------------------------------------
+    # Build fixed-length model sequences
+    # ------------------------------------------------------------------
+    # Each target player receives the last WINDOW_SIZE observed frames. Short
+    # histories are front-padded and missing values are filled using that
+    # player's available numeric history.
     input_df.set_index(['game_id', 'play_id', 'nfl_id'], inplace=True)
     grouped = input_df.groupby(level=['game_id', 'play_id', 'nfl_id'])
     target_groups = test_df[['game_id', 'play_id', 'nfl_id']].drop_duplicates()
@@ -466,8 +562,16 @@ def predict(test: pl.DataFrame, test_input: pl.DataFrame) -> pd.DataFrame:
         sequence_ids.append(key)
     
     X_test = list(sequences)
+
+    # The model predicts future displacement from the final observed position,
+    # so the final x/y coordinate is added back after inference.
     x_last, y_last = np.array([s[-1, 0] for s in X_test]), np.array([s[-1, 1] for s in X_test])
     
+    # ------------------------------------------------------------------
+    # Five-fold ensemble inference
+    # ------------------------------------------------------------------
+    # Each fold has its own scaler because scaling was fit on that fold's
+    # training data. Predictions are averaged for a more stable trajectory.
     all_preds = []
     for model, scaler in zip(_models, _scalers):
         X_sc = [scaler.transform(s) for s in X_test]
@@ -479,6 +583,11 @@ def predict(test: pl.DataFrame, test_input: pl.DataFrame) -> pd.DataFrame:
     ens_preds = np.mean(all_preds, axis=0)
     H = ens_preds.shape[1]
     
+    # ------------------------------------------------------------------
+    # Format predictions for the Kaggle evaluation server
+    # ------------------------------------------------------------------
+    # Predictions are clipped to field bounds and returned in the same order as
+    # the requested rows in `test`.
     result_rows = []
     for i, sid in enumerate(sequence_ids):
         player_test = test_df[(test_df['game_id'] == sid[0]) & (test_df['play_id'] == sid[1]) & (test_df['nfl_id'] == sid[2])].sort_values('frame_id')
